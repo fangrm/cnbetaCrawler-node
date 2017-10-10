@@ -1,10 +1,12 @@
 const https = require('https');
 const fs = require('fs');
 const cheerio = require('cheerio');
+const MongoClient = require('mongodb').MongoClient;
+const DB_CONN_STR = 'mongodb://localhost:27017/xueqiuDB';
 
 const dataSavePath = './xueqiuData'; // 文章存放路径
 
-const fetchLimit = process.argv[2] || 50; // 数量限制
+const fetchLimit = process.argv[2] || 10; // 数量限制
 
 // 创建所需文件夹
 if (!fs.existsSync(dataSavePath)) {
@@ -16,6 +18,7 @@ let fetched = 0;
 let page = 1;
 let count = 20;
 let token = '';
+let limitNum = 10;
 
 // 首次登陆时访问首页获取 token
 let getToken = () => {
@@ -26,7 +29,7 @@ let getToken = () => {
                 token = res.headers['set-cookie'][1].split(/;/)[0] + ';';
                 resolve(token);
             } else {
-                console.log(res.statusCode);
+                console.log('获取 token 失败，' + res.statusCode);
                 reject(res.statusCode);
             }
         });
@@ -80,7 +83,8 @@ let getPage = (token) => {
 let getData = (pageUrl) => {
     return new Promise((resolve, reject) => {
         let client = https.get(pageUrl, (res) => {
-            if (res.statusCode === 301) {
+            if (res.statusCode !== 200) {
+                console.log('网页连接错误：' + res.statusCode);
                 client.abort();
             }
             let html = '';
@@ -112,20 +116,73 @@ let start = async function() {
     console.log(`${fetched} 条数据获取完成`);
 };
 
+let openCollection = (db, collectionName) => {
+    return new Promise((resolve, reject) => {
+        db.collection(collectionName, {safe: true}, function(err,collection) {
+            if(!err){
+                resolve(collection);
+            } else{
+                console.log('连接数据集合失败');
+                reject(-1);
+            }
+        });
+    });
+};
+
+let insertData = async function(data, db, callback) {
+    // 连接到表 site
+    let collection = await openCollection(db, 'site');
+    if (collection !== -1) {
+        await collection.save(data, (err, result) => {
+            callback(err, result);
+        });
+    } else {
+        if (limitNum > 0) {
+            console.log('重新连接数据集合');
+            limitNum--;
+            await insertData(data, db, callback);
+        } else {
+            console.log('重新连接数据集合失败');
+            limitNum = 10;
+        }
+    }
+};
+
 // 保存内容
 let savedContent = ($) => {
-    $('.stock').each((index, item) => {
-        let stockId = $(item).attr('href').substring(3);
-        let stockName = $(item).children('.stock-name').children('.name').text().trim();
-        //console.log($(item).children('.stock-name').children('.name').text());
-        let x = '   ' + stockName + '--' + stockId + '\n';
-        if (stockName && stockId) {
-            fs.appendFile('./xueqiuData/' + 'stockData' + '.txt', x, 'utf-8', (err) => {
-                if (err) {
-                    console.log(err);
-                }
-            });
-        }
+    return new Promise((resolve, reject) => {
+        $('.stock').each(async function(index, item) {
+            let stockId = $(item).attr('href').substring(3);
+            let stockName = $(item).children('.stock-name').children('.name').text().trim();
+            //console.log($(item).children('.stock-name').children('.name').text());
+            let x = '   ' + stockName + '--' + stockId + '\n';
+            if (stockName && stockId) {
+                await MongoClient.connect(DB_CONN_STR, async function(err, db) {
+                    if (err) {
+                        console.log('连接数据库失败：', + err);
+                        reject(err);
+                    } else {
+                        await insertData({
+                            "股票名称": stockName,
+                            "股票代码": stockId,
+                        }, db, (err, result) => {
+                            if (err) {
+                                console.log('数据插入集合失败');
+                                reject(err);
+                            } else {
+                                console.log('数据插入成功');
+                                resolve(result);
+                            }
+                        });
+                    }
+                });
+                /*fs.appendFile('./xueqiuData/' + 'stockData' + '.txt', x, 'utf-8', (err) => {
+                    if (err) {
+                        console.log(err);
+                    }
+                });*/
+            }
+        });
     });
 };
 
