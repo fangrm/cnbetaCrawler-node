@@ -6,7 +6,7 @@ const DB_CONN_STR = 'mongodb://localhost:27017/xueqiuDB';
 
 const dataSavePath = './xueqiuData'; // 文章存放路径
 
-const fetchLimit = process.argv[2] || 10; // 数量限制
+const fetchLimit = process.argv[2] || 2; // 数量限制
 
 // 创建所需文件夹
 if (!fs.existsSync(dataSavePath)) {
@@ -15,10 +15,17 @@ if (!fs.existsSync(dataSavePath)) {
 
 // 计数器
 let fetched = 0;
+// 当前页码
 let page = 1;
+// 数据index
 let count = 20;
 let token = '';
+// 连接失败最大重连次数
 let limitNum = 10;
+let myDb;
+// 存入数据库的数据计数
+let aa = 0;
+
 
 // 首次登陆时访问首页获取 token
 let getToken = () => {
@@ -36,9 +43,8 @@ let getToken = () => {
     });
 };
 
+// 获取页面上的所有用户数据
 let getPage = (token) => {
-    console.log('getPage');
-    console.log(fetched);
     return new Promise((resolve, reject) => {
         let client = https.get({
             hostname: 'xueqiu.com',
@@ -50,7 +56,6 @@ let getPage = (token) => {
         }, (res) => {
             if (res.statusCode === 302) {
                 client.abort();
-                //getPage();
             }
             let rawData = '';
             res.on('data', (chunk) => {
@@ -60,49 +65,44 @@ let getPage = (token) => {
                 try {
                     let parsedData = JSON.parse(rawData);
                     //console.log(parsedData);
-                    parsedData.list.forEach(async function(data) {
-                        let pageUrl = 'https://xueqiu.com' + '/P/' + data.symbol;
-                        await getData(pageUrl);
-                    });
-                    resolve(parsedData);
-                    console.log(`第 ${page} 页数据获取完成`);
+                    resolve(parsedData.list);
+                    console.log(`第 ${page} 页数据获取完成，将存入数据库`);
                     page++;
-                    count = count*page;
                 } catch (e) {
-                    //reject(e);
-                    console.log(`获取第 ${page} 用户信息失败`);
-                    fetched++;
+                    console.log(`获取第 ${page} 页用户信息失败`);
                 }
+                fetched++;
             });
         }).on('error', (err) => {
+            reject(err);
             console.log('pageError: ' + err);
         });
     });
 };
 
-let getData = (pageUrl) => {
+// 获取每个用户的股票数据
+let getData = async function(pageUrl) {
     return new Promise((resolve, reject) => {
         let client = https.get(pageUrl, (res) => {
             if (res.statusCode !== 200) {
                 console.log('网页连接错误：' + res.statusCode);
                 client.abort();
+                reject(res.statusCode);
             }
             let html = '';
             res.setEncoding('utf-8');
             res.on('data', (chunk) => {
                 html += chunk;
             });
-            res.on('end', () => {
+            res.on('end', async function() {
                 if (html) {
-                    fetched++;
                     const $ = cheerio.load(html);
-                    savedContent($);
-                    resolve(html);
+                    resolve($);
                 }
             });
         }).on('error', (err) => {
-            //reject(err);
-            console.log('dataError: ' + err);
+            reject(err);
+            console.log('获取用户数据失败: ' + err);
         });
     });
 };
@@ -111,11 +111,18 @@ let start = async function() {
     let token = await getToken();
     console.log('token: ' + token);
     while (fetched < fetchLimit) {
-        await getPage(token);
+        let pageUrlList = await getPage(token);
+        for (let i = 0; i < pageUrlList.length; i++) {
+            let pageUrl = 'https://xueqiu.com' + '/P/' + pageUrlList[i].symbol;
+            // 获取页面数据并用 cheerio 处理
+            let $ = await getData(pageUrl);
+            await savedContent($);
+        }
     }
-    console.log(`${fetched} 条数据获取完成`);
+    console.log(`${fetched} 页数据获取完成`);
 };
 
+// 打开数据集合
 let openCollection = (db, collectionName) => {
     return new Promise((resolve, reject) => {
         db.collection(collectionName, {safe: true}, function(err,collection) {
@@ -129,18 +136,48 @@ let openCollection = (db, collectionName) => {
     });
 };
 
-let insertData = async function(data, db, callback) {
+// 数据存入数据库
+let saveDataToCollection = (data, collection) => {
+    return new Promise((resolve, reject) => {
+        collection.save(data, (err, result) => {
+            if (err) {
+                reject(err);
+                console.log('数据存入集合失败');
+            } else {
+                resolve(result);
+                aa++;
+                console.log('数据存入成功' + aa);
+            }
+        });
+    });
+};
+
+// 连接数据库
+let connectDB = (dbName) => {
+    return new Promise((resolve, reject) => {
+        MongoClient.connect(dbName, (err, db) => {
+            if (err) {
+                console.log('连接数据库失败：', + err);
+                return reject(-1);
+            } else {
+                resolve(db);
+            }
+        });
+    });
+
+};
+
+// 执行插入数据的函数
+let insertData = async function(data, db) {
     // 连接到表 site
     let collection = await openCollection(db, 'site');
     if (collection !== -1) {
-        await collection.save(data, (err, result) => {
-            callback(err, result);
-        });
+        await saveDataToCollection(data, collection);
     } else {
         if (limitNum > 0) {
             console.log('重新连接数据集合');
             limitNum--;
-            await insertData(data, db, callback);
+            await insertData(data, db);
         } else {
             console.log('重新连接数据集合失败');
             limitNum = 10;
@@ -149,42 +186,29 @@ let insertData = async function(data, db, callback) {
 };
 
 // 保存内容
-let savedContent = ($) => {
-    return new Promise((resolve, reject) => {
-        $('.stock').each(async function(index, item) {
-            let stockId = $(item).attr('href').substring(3);
-            let stockName = $(item).children('.stock-name').children('.name').text().trim();
-            //console.log($(item).children('.stock-name').children('.name').text());
-            let x = '   ' + stockName + '--' + stockId + '\n';
-            if (stockName && stockId) {
-                await MongoClient.connect(DB_CONN_STR, async function(err, db) {
-                    if (err) {
-                        console.log('连接数据库失败：', + err);
-                        reject(err);
-                    } else {
-                        await insertData({
-                            "股票名称": stockName,
-                            "股票代码": stockId,
-                        }, db, (err, result) => {
-                            if (err) {
-                                console.log('数据插入集合失败');
-                                reject(err);
-                            } else {
-                                console.log('数据插入成功');
-                                resolve(result);
-                            }
-                        });
-                    }
-                });
-                /*fs.appendFile('./xueqiuData/' + 'stockData' + '.txt', x, 'utf-8', (err) => {
-                    if (err) {
-                        console.log(err);
-                    }
-                });*/
+let savedContent = async function($) {
+    await $('.stock').each(async function(index, item) {
+        let stockId = $(item).attr('href').substring(3);
+        let stockName = $(item).children('.stock-name').children('.name').text().trim();
+        //let x = '   ' + stockName + '--' + stockId + '\n';
+        if (stockName && stockId) {
+            if (!myDb) {
+                myDb = await connectDB(DB_CONN_STR);
             }
-        });
+            if (myDb !== -1) {
+                await insertData({
+                    "股票名称": stockName,
+                    "股票代码": stockId,
+                }, myDb);
+            }
+            /*fs.appendFile('./xueqiuData/' + 'stockData' + '.txt', x, 'utf-8', (err) => {
+                if (err) {
+                    console.log(err);
+                }
+            });*/
+        }
     });
 };
 
-console.log(`即将抓取 ${fetchLimit} 条数据`);
+console.log(`即将抓取 ${fetchLimit} 页数据`);
 start();
